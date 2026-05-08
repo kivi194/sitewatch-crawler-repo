@@ -18,6 +18,8 @@ jobs:
           cache-dependency-path: requirements.txt
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Install Playwright browsers
+        run: playwright install chromium --with-deps
       - name: Run crawler
         env:
           CRAWLER_INGEST_SECRET: ${{ secrets.CRAWLER_INGEST_SECRET }}
