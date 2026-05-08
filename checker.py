@@ -74,8 +74,7 @@ def crawlable(url: str) -> bool:
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def head_check(url: str, session: requests.Session):
     """Return (status_code, error_string). Falls back from HEAD to GET on 405."""
