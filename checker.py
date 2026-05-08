@@ -12,6 +12,7 @@ Optional env vars:
 
 import os
 import sys
+import re
 import base64
 import requests
 from bs4 import BeautifulSoup
@@ -44,10 +45,10 @@ SITES = [
 ]
 
 MAX_PAGES_PER_SITE      = 200
-REQUEST_DELAY           = 0.3   # seconds between page GETs (be polite)
+REQUEST_DELAY           = 0.3
 TIMEOUT                 = 15
-EXTERNAL_CHECK_WORKERS  = 10    # concurrent threads for external link checks
-RETRY_ON_ERROR          = 1     # retries for transient failures
+EXTERNAL_CHECK_WORKERS  = 10
+RETRY_ON_ERROR          = 1
 
 HEADERS = {
     "User-Agent": (
@@ -59,17 +60,24 @@ HEADERS = {
 
 SKIP_SCHEMES = ("mailto:", "tel:", "javascript:", "#", "data:", "sms:", "whatsapp:")
 
-# URL path segments that are never useful to crawl or check
 SKIP_PATH_SEGMENTS = (
-    "cdn-cgi",      # Cloudflare (email obfuscation, etc.)
-    "wp-json",      # WordPress REST API
-    "wp-admin",     # WordPress admin
-    "xmlrpc.php",   # WordPress XML-RPC
-    "feed",         # RSS feeds
-    ".xml",         # XML files (handled via sitemap separately)
-    ".pdf", ".zip", ".jpg", ".jpeg", ".png", ".gif", ".svg",
-    ".mp4", ".mp3", ".webp", ".ico", ".woff", ".woff2", ".ttf",
+    "cdn-cgi", "wp-json", "wp-admin", "xmlrpc.php", "feed",
+    ".xml", ".pdf", ".zip", ".jpg", ".jpeg", ".png", ".gif",
+    ".svg", ".mp4", ".mp3", ".webp", ".ico", ".woff", ".woff2", ".ttf",
 )
+
+# Domains that block crawlers but are fine for real users — skip entirely
+BOT_PROTECTED_DOMAINS = {
+    "trustpilot.com", "facebook.com", "fb.com", "instagram.com",
+    "twitter.com", "x.com", "linkedin.com", "youtube.com",
+    "google.com", "google.co.il", "apple.com", "amazon.com",
+    "whatsapp.com", "tiktok.com", "pinterest.com", "yelp.com",
+    "tripadvisor.com", "glassdoor.com", "capterra.com",
+    "g2.com", "trustindex.io", "reviews.io",
+}
+
+# Only these HTTP statuses mean "genuinely broken"
+BROKEN_STATUSES = {404, 410, 500, 502, 503, 504}
 
 CTA_KEYWORDS = {
     "buy", "order", "purchase", "add to cart", "checkout", "contact",
@@ -100,24 +108,44 @@ def should_skip(url: str) -> bool:
     return any(seg in path for seg in SKIP_PATH_SEGMENTS)
 
 
+def is_bot_protected(url: str) -> bool:
+    netloc = urlparse(url).netloc.lower().removeprefix("www.")
+    return any(netloc == d or netloc.endswith("." + d) for d in BOT_PROTECTED_DOMAINS)
+
+
+def is_widget_text(text: str) -> bool:
+    """Return True if the link text looks like auto-generated widget content."""
+    # Strip non-alpha chars — if less than 3 real letters remain, it's widget noise
+    clean = re.sub(r"[^a-zA-Z\s]", "", text).strip()
+    return len(clean) < 3
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def head_check(url: str, session: requests.Session, retries: int = RETRY_ON_ERROR):
-    """HEAD check with GET fallback on 405. Retries once on transient errors."""
+    """HEAD with GET fallback on 405. Retries once on transient errors."""
     for attempt in range(retries + 1):
         try:
             r = session.head(url, timeout=TIMEOUT, allow_redirects=True)
             if r.status_code == 405:
                 r = session.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True)
                 r.close()
-            # Retry on 503/429 (server overloaded / rate limited)
             if r.status_code in (429, 503) and attempt < retries:
                 time.sleep(2)
                 continue
             return r.status_code, None
         except requests.exceptions.SSLError as e:
+            # Try HTTP fallback before reporting SSL error
+            if url.startswith("https://"):
+                http_url = "http://" + url[8:]
+                try:
+                    r2 = session.head(http_url, timeout=TIMEOUT, allow_redirects=True)
+                    if r2.status_code < 400:
+                        return r2.status_code, None   # works over HTTP — not user-facing
+                except Exception:
+                    pass
             return None, f"SSL error: {str(e)[:100]}"
         except requests.exceptions.ConnectionError as e:
             if attempt < retries:
@@ -134,16 +162,24 @@ def head_check(url: str, session: requests.Session, retries: int = RETRY_ON_ERRO
     return None, "Failed after retries"
 
 
+def is_truly_broken(status, error: str) -> bool:
+    """Return True only for genuine breakage — not bot-blocks or auth walls."""
+    if error:
+        return True   # connection error, SSL, timeout = real problem
+    return status in BROKEN_STATUSES
+
+
 # ---------------------------------------------------------------------------
 # Sitemap discovery
 # ---------------------------------------------------------------------------
 
-SITEMAP_PATHS = ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml",
-                 "/wp-sitemap.xml", "/page-sitemap.xml", "/post-sitemap.xml"]
+SITEMAP_PATHS = [
+    "/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml",
+    "/wp-sitemap.xml", "/page-sitemap.xml", "/post-sitemap.xml",
+]
 
 
 def fetch_sitemap_urls(base_url: str, session: requests.Session) -> list:
-    """Try common sitemap paths and extract all <loc> URLs for the same domain."""
     found = []
     for path in SITEMAP_PATHS:
         try:
@@ -151,13 +187,10 @@ def fetch_sitemap_urls(base_url: str, session: requests.Session) -> list:
             if r.status_code != 200 or "xml" not in r.headers.get("content-type", ""):
                 continue
             soup = BeautifulSoup(r.text, "xml")
-            # sitemap index — contains <sitemap><loc> pointing to child sitemaps
             for sitemap_tag in soup.find_all("sitemap"):
                 loc = sitemap_tag.find("loc")
                 if loc:
-                    child = fetch_sitemap_urls(loc.text.strip(), session)
-                    found.extend(child)
-            # regular sitemap — contains <url><loc>
+                    found.extend(fetch_sitemap_urls(loc.text.strip(), session))
             for url_tag in soup.find_all("url"):
                 loc = url_tag.find("loc")
                 if loc:
@@ -165,7 +198,7 @@ def fetch_sitemap_urls(base_url: str, session: requests.Session) -> list:
                     if same_domain(u, base_url):
                         found.append(u)
             if found:
-                print(f"    Sitemap found at {path}: {len(found)} URLs")
+                print(f"    Sitemap: {len(found)} URLs at {path}")
                 break
         except Exception:
             continue
@@ -179,16 +212,11 @@ def fetch_sitemap_urls(base_url: str, session: requests.Session) -> list:
 def get_section_hint(tag) -> str:
     for parent in tag.parents:
         name = getattr(parent, "name", None)
-        if name == "header":
-            return "Header"
-        if name == "nav":
-            return "Navigation"
-        if name == "footer":
-            return "Footer"
-        if name == "form":
-            return "Form"
-        if name == "aside":
-            return "Sidebar"
+        if name == "header":    return "Header"
+        if name == "nav":       return "Navigation"
+        if name == "footer":    return "Footer"
+        if name == "form":      return "Form"
+        if name == "aside":     return "Sidebar"
         if name in ("main", "article", "section"):
             return "Main content"
     return "Main content"
@@ -227,15 +255,11 @@ def get_issue_type(status, error: str, is_form: bool) -> str:
         return "broken_form"
     if error:
         err = error.lower()
-        if "ssl" in err:
-            return "ssl_error"
-        if "timeout" in err:
-            return "timeout"
+        if "ssl" in err:   return "ssl_error"
+        if "timeout" in err: return "timeout"
         return "unreachable"
-    if status == 404:
-        return "broken_link"
-    if status and status >= 500:
-        return "server_error"
+    if status == 404:      return "broken_link"
+    if status and status >= 500: return "server_error"
     return "broken_link"
 
 
@@ -244,40 +268,221 @@ def get_severity(element_type: str, issue_type: str, page_url: str, broken_url: 
 
     if element_type == "Form submit":
         return "critical"
-
     if issue_type in ("broken_form", "server_error"):
         if any(w in url_lower for w in ("cart", "checkout", "order", "payment", "contact")):
             return "critical"
-
     if element_type == "CTA button":
         return "high"
-
     if element_type == "Navigation link":
         return "medium"
-
     if element_type == "Footer link":
         return "low"
-
     return "medium"
 
 
 def get_plain_english(visible_text: str, element_type: str, page_title: str,
                       issue_type: str, http_status, error: str) -> str:
-    elem = element_type.lower()
+    elem      = element_type.lower()
     text_part = f'"{visible_text}"' if visible_text and visible_text != "[no text]" else f"A {elem}"
     page_part = f'the "{page_title}" page' if page_title else "a page"
-
-    problems = {
-        "broken_link":        "links to a page that no longer exists",
-        "broken_form":        "submits to an endpoint that isn't responding — the form won't work",
-        "server_error":       f"is hitting a server error ({http_status}) — something broke on the backend",
-        "ssl_error":          "has a security certificate issue — browsers may block it",
-        "timeout":            "didn't respond in time — the destination may be down",
-        "unreachable":        "points to a site that can't be reached",
-        "empty_destination":  "has no destination — it does nothing when clicked",
+    problems  = {
+        "broken_link":       "links to a page that no longer exists",
+        "broken_form":       "submits to an endpoint that isn't responding — the form won't work",
+        "server_error":      f"is hitting a server error ({http_status}) — something broke on the backend",
+        "ssl_error":         "has a security certificate issue — browsers may block it",
+        "timeout":           "didn't respond in time — the destination may be down",
+        "unreachable":       "points to a site that can't be reached",
+        "empty_destination": "has no destination — it does nothing when clicked",
     }
     problem = problems.get(issue_type, f"is broken (HTTP {http_status or 'error'})")
     return f"The {text_part} {elem} on {page_part} {problem}."
+
+
+# ---------------------------------------------------------------------------
+# New UX checks (pure HTML — no external requests, zero false positives)
+# ---------------------------------------------------------------------------
+
+def check_broken_images(soup, url: str, page_title: str, session, checked, checked_lock) -> list:
+    """Internal images that return 4xx/5xx."""
+    findings = []
+    seen = set()
+    for img in soup.find_all("img", src=True):
+        src = img.get("src", "").strip()
+        if not src or src.startswith("data:"):
+            continue
+        full_src = urljoin(url, src)
+        if not same_domain(full_src, url) or should_skip(full_src):
+            continue
+        norm_src = normalize(full_src)
+        if norm_src in seen:
+            continue
+        seen.add(norm_src)
+
+        with checked_lock:
+            cached = checked.get(norm_src)
+        if cached is None:
+            status, error = head_check(full_src, session)
+            with checked_lock:
+                checked[norm_src] = (status, error)
+        else:
+            status, error = cached
+
+        if status in BROKEN_STATUSES:
+            alt = img.get("alt", "").strip() or "[no alt text]"
+            section = get_section_hint(img)
+            findings.append({
+                "severity":     "high",
+                "issue_type":   "broken_image",
+                "page_url":     url,
+                "page_title":   page_title,
+                "section_hint": section,
+                "element_type": "Image",
+                "visible_text": alt[:80],
+                "broken_url":   full_src,
+                "http_status":  status,
+                "plain_english": (
+                    f'An image ("{alt}") on the "{page_title}" page '
+                    f"is broken and won't display — visitors will see a broken image icon."
+                ),
+            })
+    return findings
+
+
+def check_empty_elements(soup, url: str, page_title: str) -> list:
+    """Buttons and links with no visible text, aria-label, or image."""
+    findings = []
+
+    for btn in soup.find_all("button"):
+        text  = btn.get_text(strip=True)
+        aria  = btn.get("aria-label", "").strip()
+        title = btn.get("title", "").strip()
+        if not text and not aria and not title and not btn.find("img"):
+            section = get_section_hint(btn)
+            findings.append({
+                "severity":     "medium",
+                "issue_type":   "empty_element",
+                "page_url":     url,
+                "page_title":   page_title,
+                "section_hint": section,
+                "element_type": "Button",
+                "visible_text": "[no text]",
+                "plain_english": (
+                    f'A button on the "{page_title}" page has no visible text or label — '
+                    f"users can't tell what it does."
+                ),
+            })
+
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "").strip()
+        if any(href.startswith(s) for s in SKIP_SCHEMES):
+            continue
+        text = a.get_text(strip=True)
+        aria = a.get("aria-label", "").strip()
+        if not text and not aria and not a.find("img"):
+            section = get_section_hint(a)
+            findings.append({
+                "severity":     "low",
+                "issue_type":   "empty_element",
+                "page_url":     url,
+                "page_title":   page_title,
+                "section_hint": section,
+                "element_type": "Link",
+                "visible_text": "[no text]",
+                "plain_english": (
+                    f'A link on the "{page_title}" page has no visible text — '
+                    f"users can't see it or know where it goes."
+                ),
+            })
+
+    return findings
+
+
+def check_missing_title(soup, url: str) -> list:
+    """Pages with no <title> tag or an empty one."""
+    title_tag = soup.find("title")
+    if not title_tag or not title_tag.get_text(strip=True):
+        return [{
+            "severity":     "medium",
+            "issue_type":   "missing_title",
+            "page_url":     url,
+            "page_title":   url,
+            "section_hint": "Page head",
+            "element_type": "Page",
+            "visible_text": "Missing title",
+            "plain_english": (
+                f"The page at {url} has no title tag — "
+                f"this affects browser tabs, bookmarks, and search engine rankings."
+            ),
+        }]
+    return []
+
+
+def check_mixed_content(soup, url: str, page_title: str) -> list:
+    """HTTP resources loaded on an HTTPS page — browsers block these silently."""
+    if not url.startswith("https://"):
+        return []
+
+    findings = []
+    checks = [
+        (soup.find_all("img",    src=True),              "src",  "Image",      "high"),
+        (soup.find_all("script", src=True),              "src",  "Script",     "high"),
+        (soup.find_all("iframe", src=True),              "src",  "iFrame",     "medium"),
+        (soup.find_all("link",   rel="stylesheet"),      "href", "Stylesheet", "medium"),
+    ]
+    seen = set()
+    for tags, attr, elem_label, severity in checks:
+        for tag in tags:
+            resource = tag.get(attr, "").strip()
+            if resource.startswith("http://") and resource not in seen:
+                seen.add(resource)
+                section = get_section_hint(tag)
+                findings.append({
+                    "severity":     severity,
+                    "issue_type":   "mixed_content",
+                    "page_url":     url,
+                    "page_title":   page_title,
+                    "section_hint": section,
+                    "element_type": elem_label,
+                    "visible_text": resource[:80],
+                    "broken_url":   resource,
+                    "plain_english": (
+                        f'A {elem_label.lower()} on "{page_title}" loads over HTTP on an HTTPS page '
+                        f"— browsers will block it silently, breaking the page for visitors."
+                    ),
+                })
+    return findings
+
+
+def check_broken_anchors(soup, url: str, page_title: str) -> list:
+    """<a href="#id"> links where the target ID doesn't exist on the page."""
+    all_ids = {tag.get("id") for tag in soup.find_all(id=True)}
+    all_names = {tag.get("name") for tag in soup.find_all(attrs={"name": True})}
+    valid_anchors = all_ids | all_names
+
+    findings = []
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"].strip()
+        if not href.startswith("#"):
+            continue
+        anchor = href[1:]
+        if anchor and anchor not in valid_anchors:
+            visible = tag.get_text(strip=True) or tag.get("aria-label", "") or "[no text]"
+            section = get_section_hint(tag)
+            findings.append({
+                "severity":     "low",
+                "issue_type":   "broken_anchor",
+                "page_url":     url,
+                "page_title":   page_title,
+                "section_hint": section,
+                "element_type": "Anchor link",
+                "visible_text": visible[:80],
+                "broken_url":   f"{url}#{anchor}",
+                "plain_english": (
+                    f'The "{visible}" link on "{page_title}" jumps to #{anchor} '
+                    f"but that section doesn't exist on the page — clicking it does nothing."
+                ),
+            })
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -288,26 +493,24 @@ def crawl_site(base_url: str, secret: str = "") -> dict:
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    visited: set     = set()
-    queue: deque     = deque()
-    checked          = {}          # url -> (status, error)  shared check cache
-    checked_lock     = Lock()
-    findings         = []
-    pages_crawled    = 0
-    started_at       = now_iso()
+    visited      = set()
+    queue        = deque()
+    checked      = {}
+    checked_lock = Lock()
+    findings     = []
+    pages_crawled = 0
+    started_at   = now_iso()
 
     print(f"\n{'='*65}")
     print(f"  Crawling: {base_url}")
     print(f"{'='*65}")
 
-    # Seed queue from sitemap first, then homepage
     sitemap_urls = fetch_sitemap_urls(base_url, session)
     for u in sitemap_urls:
         queue.append(u)
-    queue.appendleft(base_url)   # homepage always first
+    queue.appendleft(base_url)
 
     def check_url(url: str):
-        """Thread-safe cached URL check."""
         norm = normalize(url)
         with checked_lock:
             if norm in checked:
@@ -318,7 +521,7 @@ def crawl_site(base_url: str, secret: str = "") -> dict:
         return result
 
     while queue and pages_crawled < MAX_PAGES_PER_SITE:
-        url = queue.popleft()
+        url  = queue.popleft()
         norm = normalize(url)
 
         if norm in visited or should_skip(url):
@@ -335,7 +538,6 @@ def crawl_site(base_url: str, secret: str = "") -> dict:
             time.sleep(REQUEST_DELAY)
             continue
 
-        # Mark GET status so we don't re-check this URL as an external link
         with checked_lock:
             checked[norm] = (resp.status_code, None)
 
@@ -343,13 +545,14 @@ def crawl_site(base_url: str, secret: str = "") -> dict:
             time.sleep(REQUEST_DELAY)
             continue
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        page_title = soup.find("title")
-        page_title = page_title.get_text(strip=True)[:120] if page_title else urlparse(url).path or base_url
+        soup       = BeautifulSoup(resp.text, "html.parser")
+        title_tag  = soup.find("title")
+        page_title = title_tag.get_text(strip=True)[:120] if title_tag else urlparse(url).path or base_url
 
-        # Collect links to process
-        links_to_check = []   # (full_url, tag, is_external)
+        page_findings_before = len(findings)
 
+        # --- External link checks ---
+        external_items = {}
         for tag in soup.find_all("a", href=True):
             href = tag["href"].strip()
             if any(href.startswith(s) for s in SKIP_SCHEMES):
@@ -361,13 +564,9 @@ def crawl_site(base_url: str, secret: str = "") -> dict:
             if same_domain(full, base_url):
                 if norm_full not in visited:
                     queue.append(full)
-                # Only report internal broken links, skip if we'll crawl it
-                # (crawl will capture actual status on the GET)
             else:
-                links_to_check.append((full, tag, True))
-
-        # Check external links concurrently
-        external_urls = list({normalize(u): (u, tag) for u, tag, _ in links_to_check}.values())
+                if not is_bot_protected(full):
+                    external_items[norm_full] = (full, tag)
 
         def check_and_return(item):
             full, tag = item
@@ -375,31 +574,35 @@ def crawl_site(base_url: str, secret: str = "") -> dict:
             return full, tag, status, error
 
         with ThreadPoolExecutor(max_workers=EXTERNAL_CHECK_WORKERS) as pool:
-            futures = {pool.submit(check_and_return, item): item for item in external_urls}
+            futures = {pool.submit(check_and_return, item): item
+                       for item in external_items.values()}
             for future in as_completed(futures):
                 full, tag, status, error = future.result()
-                if status is None or status >= 400:
-                    visible   = (tag.get_text(strip=True) or tag.get("aria-label", "") or "[no text]")[:80]
-                    section   = get_section_hint(tag)
-                    elem_type = get_element_type(tag, section, visible)
-                    issue_type = get_issue_type(status, error or "", is_form=False)
-                    severity   = get_severity(elem_type, issue_type, url, full)
-                    findings.append({
-                        "severity":      severity,
-                        "issue_type":    issue_type,
-                        "page_url":      url,
-                        "page_title":    page_title,
-                        "section_hint":  section,
-                        "element_type":  elem_type,
-                        "visible_text":  visible,
-                        "broken_url":    full,
-                        "http_status":   status,
-                        "plain_english": get_plain_english(
-                            visible, elem_type, page_title, issue_type, status, error or ""
-                        ),
-                    })
+                if not is_truly_broken(status, error):
+                    continue
+                visible   = (tag.get_text(strip=True) or tag.get("aria-label", "") or "[no text]")[:80]
+                if is_widget_text(visible):
+                    continue
+                section   = get_section_hint(tag)
+                elem_type = get_element_type(tag, section, visible)
+                issue_type = get_issue_type(status, error or "", is_form=False)
+                severity   = get_severity(elem_type, issue_type, url, full)
+                findings.append({
+                    "severity":      severity,
+                    "issue_type":    issue_type,
+                    "page_url":      url,
+                    "page_title":    page_title,
+                    "section_hint":  section,
+                    "element_type":  elem_type,
+                    "visible_text":  visible,
+                    "broken_url":    full,
+                    "http_status":   status,
+                    "plain_english": get_plain_english(
+                        visible, elem_type, page_title, issue_type, status, error or ""
+                    ),
+                })
 
-        # Check form actions
+        # --- Form action checks ---
         for form in soup.find_all("form"):
             action = (form.get("action") or "").strip()
             if not action or any(action.startswith(s) for s in SKIP_SCHEMES):
@@ -407,45 +610,52 @@ def crawl_site(base_url: str, secret: str = "") -> dict:
             full_action = urljoin(url, action)
             if not crawlable(full_action) or should_skip(full_action):
                 continue
-
             status, error = check_url(full_action)
-            if status is None or status >= 400:
-                section    = get_section_hint(form)
-                issue_type = get_issue_type(status, error or "", is_form=True)
-                severity   = get_severity("Form submit", issue_type, url, full_action)
-                submit_btn = form.find(["button", "input"], {"type": ["submit", "button"]})
-                visible    = ""
-                if submit_btn:
-                    visible = (
-                        submit_btn.get_text(strip=True)
-                        or submit_btn.get("value", "")
-                        or submit_btn.get("aria-label", "")
-                    )[:80]
-                visible = visible or "Submit"
-                findings.append({
-                    "severity":      severity,
-                    "issue_type":    issue_type,
-                    "page_url":      url,
-                    "page_title":    page_title,
-                    "section_hint":  section,
-                    "element_type":  "Form submit",
-                    "visible_text":  visible,
-                    "broken_url":    full_action,
-                    "http_status":   status,
-                    "plain_english": get_plain_english(
-                        visible, "Form submit", page_title, issue_type, status, error or ""
-                    ),
-                })
+            if not is_truly_broken(status, error):
+                continue
+            section    = get_section_hint(form)
+            issue_type = get_issue_type(status, error or "", is_form=True)
+            severity   = get_severity("Form submit", issue_type, url, full_action)
+            submit_btn = form.find(["button", "input"], {"type": ["submit", "button"]})
+            visible    = ""
+            if submit_btn:
+                visible = (
+                    submit_btn.get_text(strip=True)
+                    or submit_btn.get("value", "")
+                    or submit_btn.get("aria-label", "")
+                )[:80]
+            visible = visible or "Submit"
+            findings.append({
+                "severity":      severity,
+                "issue_type":    issue_type,
+                "page_url":      url,
+                "page_title":    page_title,
+                "section_hint":  section,
+                "element_type":  "Form submit",
+                "visible_text":  visible,
+                "broken_url":    full_action,
+                "http_status":   status,
+                "plain_english": get_plain_english(
+                    visible, "Form submit", page_title, issue_type, status, error or ""
+                ),
+            })
 
-        # Take one screenshot for this page if it has findings, attach to all of them
-        page_findings = [f for f in findings if f["page_url"] == url and "screenshot_url" not in f]
-        if page_findings and PLAYWRIGHT_AVAILABLE:
+        # --- New UX checks (pure HTML) ---
+        findings.extend(check_broken_images(soup, url, page_title, session, checked, checked_lock))
+        findings.extend(check_empty_elements(soup, url, page_title))
+        findings.extend(check_missing_title(soup, url))
+        findings.extend(check_mixed_content(soup, url, page_title))
+        findings.extend(check_broken_anchors(soup, url, page_title))
+
+        # --- Screenshot for pages with new findings ---
+        new_findings = [f for f in findings[page_findings_before:] if "screenshot_url" not in f]
+        if new_findings and PLAYWRIGHT_AVAILABLE:
             print(f"       Taking screenshot of {url[:70]}")
             img_b64 = take_screenshot(url)
             if img_b64:
                 shot_url = upload_screenshot(url, img_b64, secret)
                 if shot_url:
-                    for f in page_findings:
+                    for f in new_findings:
                         f["screenshot_url"] = shot_url
 
         time.sleep(REQUEST_DELAY)
@@ -466,16 +676,15 @@ def crawl_site(base_url: str, secret: str = "") -> dict:
 # Screenshot capture + upload
 # ---------------------------------------------------------------------------
 
-def take_screenshot(url: str) -> str | None:
-    """Navigate to a page with Playwright and return a base64 JPEG screenshot."""
+def take_screenshot(url: str):
     if not PLAYWRIGHT_AVAILABLE:
         return None
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            page    = browser.new_page(viewport={"width": 1280, "height": 800})
             page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            page.wait_for_timeout(1500)   # let lazy-loaded content settle
+            page.wait_for_timeout(1500)
             img_bytes = page.screenshot(type="jpeg", quality=75, full_page=False)
             browser.close()
         return base64.b64encode(img_bytes).decode("utf-8")
@@ -484,28 +693,19 @@ def take_screenshot(url: str) -> str | None:
         return None
 
 
-def upload_screenshot(page_url: str, image_base64: str, secret: str) -> str | None:
-    """Upload a base64 screenshot to Lovable and return the public URL."""
+def upload_screenshot(page_url: str, image_base64: str, secret: str):
     upload_url = INGEST_URL.replace("/crawler/ingest", "/crawler/upload-screenshot")
     try:
         resp = requests.post(
             upload_url,
-            json={
-                "page_url":     page_url,
-                "image_base64": image_base64,
-                "mime_type":    "image/jpeg",
-            },
-            headers={
-                "Authorization": f"Bearer {secret}",
-                "Content-Type":  "application/json",
-            },
+            json={"page_url": page_url, "image_base64": image_base64, "mime_type": "image/jpeg"},
+            headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
             timeout=30,
         )
         if resp.status_code == 200:
             return resp.json().get("screenshot_url")
-        else:
-            print(f"    Screenshot upload failed: HTTP {resp.status_code}")
-            return None
+        print(f"    Screenshot upload failed: HTTP {resp.status_code}")
+        return None
     except Exception as e:
         print(f"    Screenshot upload error: {e}")
         return None
@@ -523,19 +723,15 @@ def post_to_ingest(payload: dict, secret: str) -> bool:
         resp = requests.post(
             INGEST_URL,
             json=payload,
-            headers={
-                "Authorization": f"Bearer {secret}",
-                "Content-Type":  "application/json",
-            },
+            headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
             timeout=30,
         )
         if resp.status_code == 200:
             data = resp.json()
             print(f"  OK scan_id={data.get('scan_id')}  inserted={data.get('inserted')}  skipped={data.get('skipped_duplicates')}")
             return True
-        else:
-            print(f"  FAIL HTTP {resp.status_code}: {resp.text[:200]}")
-            return False
+        print(f"  FAIL HTTP {resp.status_code}: {resp.text[:200]}")
+        return False
     except Exception as e:
         print(f"  FAIL Request failed: {e}")
         return False
@@ -551,7 +747,6 @@ if __name__ == "__main__":
         print("ERROR: CRAWLER_INGEST_SECRET env var is not set.")
         sys.exit(1)
 
-    # Crawl all 3 sites in parallel
     from concurrent.futures import ThreadPoolExecutor as SitePool
     results = []
     with SitePool(max_workers=len(SITES)) as pool:
@@ -559,7 +754,6 @@ if __name__ == "__main__":
         for future in as_completed(futures):
             results.append(future.result())
 
-    # Post results sequentially (no need to hammer the ingest endpoint)
     success_count = 0
     for payload in results:
         if post_to_ingest(payload, secret):
