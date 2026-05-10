@@ -8,6 +8,10 @@ on:
         description: "Domain to scan (e.g. israelpharm.com). Leave empty to scan all sites."
         required: false
         default: ""
+      test_mode:
+        description: "Run mode: 'priority' for fast transaction tests only, leave empty for full crawl."
+        required: false
+        default: ""
 jobs:
   crawl:
     runs-on: ubuntu-latest
@@ -29,4 +33,5 @@ jobs:
         env:
           CRAWLER_INGEST_SECRET: ${{ secrets.CRAWLER_INGEST_SECRET }}
           SITE_FILTER: ${{ inputs.site }}
+          TEST_MODE: ${{ inputs.test_mode }}
         run: python checker.py

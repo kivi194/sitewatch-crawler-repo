@@ -10,6 +10,7 @@ Optional env vars:
   INGEST_URL             -- override the default endpoint URL
 """
 
+import argparse
 import os
 import sys
 import re
@@ -104,6 +105,387 @@ SITE_CONFIG = [
 # Flat list for entry point
 SITES = [s["base_url"] for s in SITE_CONFIG]
 PRIORITY_URLS = {s["base_url"]: s["priority_urls"] for s in SITE_CONFIG}
+
+# ---------------------------------------------------------------------------
+# Priority transaction test definitions
+# ---------------------------------------------------------------------------
+# Each entry is a list of tests for a site.
+# Fields:
+#   name          — human-readable label shown in logs and used as section_hint
+#   url           — page to load
+#   url_rotation  — list of URLs; one is picked per ISO week number (mutually exclusive with url)
+#   wait_for      — CSS selector to wait for before running checks (optional)
+#   checks        — list of element visibility/state assertions (see below)
+#   actions       — optional interaction steps (click, fill) with post-action assertions
+#
+# Check fields:
+#   selector  — CSS selector (Playwright picks the first match)
+#   label     — human-readable element name used in finding messages
+#   severity  — "critical" | "high"
+#   check     — "visible" (default) | "enabled" (also implies visible)
+#
+# Action fields:
+#   type      — "click" | "fill"
+#   selector  — element to interact with
+#   label     — human-readable label
+#   value     — text to type (fill only)
+#   wait_ms   — ms to wait after action (default 3000 for click, 500 for fill)
+#   severity  — severity if this action fails
+#   assert    — optional post-action assertion:
+#                 selector, check ("visible" | "url_contains"), value (url_contains), label, severity
+#
+# NOTE: Add real product slugs for israelpharm.com in url_rotation once known.
+#       Reekooz and rxfor.me slugs are already stable.
+
+_WEEK_NUM = datetime.now(timezone.utc).isocalendar()[1]
+
+PRIORITY_TESTS = {
+    # ── IsraelPharm ──────────────────────────────────────────────────────────
+    "https://israelpharm.com": [
+        {
+            "name": "Home page core elements",
+            "url": "https://israelpharm.com/",
+            "wait_for": "body",
+            "checks": [
+                {"selector": "header, .site-header, #masthead",
+                 "label": "Page header", "severity": "high"},
+                {"selector": "nav, .nav-menu, .main-navigation, #site-navigation, #primary-menu",
+                 "label": "Main navigation", "severity": "critical"},
+                {"selector": ".logo img, .site-logo, .custom-logo, header img",
+                 "label": "Header logo", "severity": "high"},
+                {"selector": (
+                    "a[href*='shop'], a[href*='catalog'], a[href*='product'], "
+                    ".shop-link, .woocommerce-loop-product__link"
+                 ),
+                 "label": "Shop / product link", "severity": "high"},
+            ],
+        },
+        {
+            "name": "Menu navigation links",
+            "url": "https://israelpharm.com/",
+            "wait_for": "nav, #site-navigation",
+            "checks": [
+                {"selector": "nav a, .nav-menu a, #primary-menu a",
+                 "label": "Navigation anchor links", "severity": "high"},
+            ],
+        },
+        {
+            "name": "Shop / category listing",
+            # /shop/ may be blocked by Cloudflare — page_load_failed finding is expected in that case
+            "url": "https://israelpharm.com/shop/",
+            "wait_for": "body",
+            "checks": [
+                {"selector": "ul.products, .products, .woocommerce-loop-product, li.product",
+                 "label": "Product grid", "severity": "critical"},
+            ],
+        },
+        {
+            # Rotate through product category pages weekly.
+            # TODO: replace with direct /product/<slug>/ URLs once product catalog is stable.
+            "name": "Product category page (weekly rotation)",
+            "url_rotation": [
+                "https://israelpharm.com/product-category/vitamins/",
+                "https://israelpharm.com/product-category/beauty/",
+                "https://israelpharm.com/product-category/supplements/",
+                "https://israelpharm.com/product-category/baby/",
+            ],
+            "wait_for": "body",
+            "checks": [
+                {"selector": "ul.products, li.product, .woocommerce-loop-product__link",
+                 "label": "Products in category", "severity": "high"},
+                {"selector": "h1, .woocommerce-products-header__title",
+                 "label": "Category title", "severity": "medium"},
+            ],
+        },
+        {
+            "name": "Checkout form presence",
+            # Cloudflare may block this — finding will show page_load_failed (expected)
+            "url": "https://israelpharm.com/checkout/",
+            "wait_for": "body",
+            "checks": [
+                {"selector": "form.checkout, .woocommerce-checkout, #customer_details",
+                 "label": "Checkout form", "severity": "critical"},
+                {"selector": (
+                    "#place_order, button[name='woocommerce_checkout_place_order'], "
+                    ".place-order button, #place_order_button"
+                 ),
+                 "label": "Place order button", "check": "enabled", "severity": "critical"},
+            ],
+        },
+        {
+            "name": "Cart add/remove",
+            # Loads a product page and clicks add-to-cart, then checks for cart confirmation.
+            # Rotate through known product pages weekly; update slugs as needed.
+            "url_rotation": [
+                "https://israelpharm.com/product-category/vitamins/",
+                "https://israelpharm.com/product-category/beauty/",
+                "https://israelpharm.com/product-category/supplements/",
+            ],
+            "wait_for": "body",
+            "checks": [
+                {"selector": "li.product a.add_to_cart_button, .add_to_cart_button",
+                 "label": "Add to cart button (listing)", "check": "enabled", "severity": "critical"},
+            ],
+            "actions": [
+                {
+                    "type": "click",
+                    "selector": "li.product a.add_to_cart_button, .add_to_cart_button",
+                    "label": "Add to cart",
+                    "severity": "critical",
+                    "wait_ms": 3000,
+                    "assert": {
+                        "selector": (
+                            ".woocommerce-message, .added_to_cart, "
+                            ".cart-count, .woocommerce-cart-link__count, "
+                            ".mini-cart-count, span.count"
+                        ),
+                        "check": "visible",
+                        "label": "Cart updated confirmation",
+                        "severity": "critical",
+                    },
+                },
+            ],
+        },
+    ],
+
+    # ── rxfor.me ─────────────────────────────────────────────────────────────
+    "https://www.rxfor.me": [
+        {
+            "name": "Home page",
+            "url": "https://www.rxfor.me/",
+            "wait_for": "body",
+            "checks": [
+                {"selector": "header, nav, .navbar, .header",
+                 "label": "Header / navigation", "severity": "critical"},
+                {"selector": (
+                    "a[href*='/auth'], a[href*='consult'], a[href*='start'], "
+                    "button[class*='cta'], .cta-button, a[href*='treatment']"
+                 ),
+                 "label": "Start consultation CTA", "severity": "critical"},
+                {"selector": "main, #main, .main-content, article",
+                 "label": "Main content area", "severity": "high"},
+            ],
+        },
+        {
+            "name": "Treatments listing",
+            "url": "https://www.rxfor.me/treatments/",
+            "wait_for": "main, body",
+            "checks": [
+                {"selector": (
+                    ".treatment-card, .treatment-item, "
+                    "a[href*='/treatments/'], article, .card"
+                 ),
+                 "label": "Treatment cards", "severity": "critical"},
+                {"selector": "h1, h2",
+                 "label": "Page heading", "severity": "high"},
+            ],
+        },
+        {
+            # Rotate through treatment pages weekly to catch individual page regressions
+            "name": "Treatment page (weekly rotation)",
+            "url_rotation": [
+                "https://www.rxfor.me/treatments/weight-loss",
+                "https://www.rxfor.me/treatments/ed-treatment",
+                "https://www.rxfor.me/treatments/testosterone-men",
+                "https://www.rxfor.me/treatments/testosterone-women",
+                "https://www.rxfor.me/treatments/hair-loss",
+                "https://www.rxfor.me/treatments/prescription-renewal",
+            ],
+            "wait_for": "main, body",
+            "checks": [
+                {"selector": "h1",
+                 "label": "Treatment title", "severity": "high"},
+                {"selector": (
+                    "a[href*='/auth'], button[class*='start'], "
+                    "a[class*='cta'], button[class*='cta'], .start-consultation"
+                 ),
+                 "label": "Start consultation button", "check": "enabled", "severity": "critical"},
+                {"selector": "img, .hero-image, .treatment-image",
+                 "label": "Treatment image", "severity": "high"},
+            ],
+        },
+        {
+            "name": "Consult / auth entry form",
+            "url": "https://www.rxfor.me/auth",
+            "wait_for": "form, input, body",
+            "checks": [
+                {"selector": "form, .form-container",
+                 "label": "Consultation form", "severity": "critical"},
+                {"selector": "input[type='email'], input[name*='email'], input[placeholder*='email' i]",
+                 "label": "Email input field", "check": "enabled", "severity": "critical"},
+                {"selector": (
+                    "button[type='submit'], input[type='submit'], "
+                    "button[class*='submit'], button[class*='continue'], button[class*='next']"
+                 ),
+                 "label": "Form submit / continue button", "check": "enabled", "severity": "critical"},
+            ],
+            # Fill a test email to verify the field is interactive; do NOT submit
+            "actions": [
+                {
+                    "type": "fill",
+                    "selector": "input[type='email'], input[name*='email']",
+                    "label": "Email field",
+                    "value": "test@example.com",
+                    "severity": "critical",
+                    "wait_ms": 500,
+                },
+            ],
+        },
+        {
+            "name": "About page",
+            "url": "https://www.rxfor.me/about",
+            "wait_for": "body",
+            "checks": [
+                {"selector": "h1, .page-title",
+                 "label": "Page title heading", "severity": "high"},
+                {"selector": "main, #main, article, .content",
+                 "label": "Main content", "severity": "high"},
+            ],
+        },
+        {
+            "name": "Contact page",
+            "url": "https://www.rxfor.me/contact",
+            "wait_for": "body",
+            "checks": [
+                {"selector": "h1, .page-title",
+                 "label": "Page title heading", "severity": "high"},
+                {"selector": "form, .contact-form, input[type='email']",
+                 "label": "Contact form or email input", "severity": "high"},
+            ],
+        },
+    ],
+
+    # ── Reekooz ───────────────────────────────────────────────────────────────
+    "https://www.reekooz.com": [
+        {
+            "name": "Home page",
+            "url": "https://www.reekooz.com/",
+            "wait_for": "body",
+            "checks": [
+                {"selector": "header, .site-header, #masthead",
+                 "label": "Page header", "severity": "high"},
+                {"selector": "nav, .nav-menu, .main-navigation, #site-navigation",
+                 "label": "Main navigation", "severity": "critical"},
+                {"selector": ".logo img, .site-logo, .custom-logo, header img",
+                 "label": "Header logo", "severity": "high"},
+                {"selector": (
+                    "a[href*='shop'], a[href*='product'], "
+                    ".wp-block-button__link, .btn, button"
+                 ),
+                 "label": "Shop / CTA button", "severity": "high"},
+            ],
+        },
+        {
+            "name": "Shop listing",
+            "url": "https://www.reekooz.com/shop/",
+            "wait_for": "ul.products, body",
+            "checks": [
+                {"selector": "ul.products, .products, li.product",
+                 "label": "Product grid", "severity": "critical"},
+                {"selector": "a.add_to_cart_button, .product .button",
+                 "label": "Add to cart buttons in listing", "check": "enabled", "severity": "high"},
+            ],
+        },
+        {
+            "name": "Zoomind product page",
+            "url": "https://www.reekooz.com/product/zoomind/",
+            "wait_for": ".product, body",
+            "checks": [
+                {"selector": "h1.product_title, .product_title",
+                 "label": "Product title", "severity": "critical"},
+                {"selector": ".price, .woocommerce-Price-amount",
+                 "label": "Product price", "severity": "critical"},
+                {"selector": "button.single_add_to_cart_button",
+                 "label": "Add to cart button", "check": "enabled", "severity": "critical"},
+                {"selector": ".woocommerce-product-gallery img, .product img",
+                 "label": "Product image", "severity": "high"},
+            ],
+            "actions": [
+                {
+                    "type": "click",
+                    "selector": "button.single_add_to_cart_button",
+                    "label": "Add to cart",
+                    "severity": "critical",
+                    "wait_ms": 3000,
+                    "assert": {
+                        "selector": (
+                            ".woocommerce-message, .added_to_cart, "
+                            ".cart-count, .mini-cart-count, span.count, "
+                            ".woocommerce-cart-link__count"
+                        ),
+                        "check": "visible",
+                        "label": "Cart confirmation / count update",
+                        "severity": "critical",
+                    },
+                },
+            ],
+        },
+        {
+            "name": "NOWONDER product page",
+            "url": "https://www.reekooz.com/product/nowonder-nasal-cleanser/",
+            "wait_for": ".product, body",
+            "checks": [
+                {"selector": "h1.product_title, .product_title",
+                 "label": "Product title", "severity": "critical"},
+                {"selector": ".price, .woocommerce-Price-amount",
+                 "label": "Product price", "severity": "critical"},
+                {"selector": "button.single_add_to_cart_button",
+                 "label": "Add to cart button", "check": "enabled", "severity": "critical"},
+            ],
+        },
+        {
+            # Rotate through vitamin pack pages weekly
+            "name": "Vitamin pack page (weekly rotation)",
+            "url_rotation": [
+                "https://www.reekooz.com/product/immune-pack/",
+                "https://www.reekooz.com/product/allergy-pack/",
+                "https://www.reekooz.com/product/healthy-weight-pack/",
+                "https://www.reekooz.com/product/sleep-pack/",
+                "https://www.reekooz.com/product/stress-pack/",
+                "https://www.reekooz.com/product/energy-pack/",
+                "https://www.reekooz.com/product/his-essentials/",
+                "https://www.reekooz.com/product/her-essentials/",
+            ],
+            "wait_for": ".product, body",
+            "checks": [
+                {"selector": "h1.product_title, .product_title",
+                 "label": "Product title", "severity": "critical"},
+                {"selector": ".price, .woocommerce-Price-amount",
+                 "label": "Product price", "severity": "critical"},
+                {"selector": "button.single_add_to_cart_button",
+                 "label": "Add to cart button", "check": "enabled", "severity": "critical"},
+                {"selector": ".woocommerce-product-gallery img, .product img",
+                 "label": "Product image", "severity": "high"},
+            ],
+        },
+        {
+            "name": "Cart page",
+            "url": "https://www.reekooz.com/cart/",
+            "wait_for": "body",
+            "checks": [
+                {"selector": (
+                    ".woocommerce-cart-form, .cart, "
+                    "table.shop_table, .woocommerce-cart"
+                 ),
+                 "label": "Cart container", "severity": "critical"},
+            ],
+        },
+        {
+            "name": "Checkout form presence",
+            "url": "https://www.reekooz.com/checkout/",
+            "wait_for": "body",
+            "checks": [
+                {"selector": "form.checkout, .woocommerce-checkout, #customer_details",
+                 "label": "Checkout form", "severity": "critical"},
+                {"selector": (
+                    "#place_order, button[name='woocommerce_checkout_place_order'], "
+                    ".place-order button"
+                 ),
+                 "label": "Place order button", "check": "enabled", "severity": "critical"},
+            ],
+        },
+    ],
+}
 
 MAX_PAGES_PER_SITE      = 200
 REQUEST_DELAY           = 0.3
@@ -662,6 +1044,357 @@ def check_broken_anchors(soup, url: str, page_title: str, site_domain: str) -> l
 
 
 # ---------------------------------------------------------------------------
+# Priority test helpers
+# ---------------------------------------------------------------------------
+
+def _priority_finding(
+    site_domain: str,
+    url: str,
+    page_title: str,
+    test_name: str,
+    issue_type: str,
+    severity: str,
+    visible_text: str,
+    plain_english: str,
+    http_status=None,
+    selector: str = "",
+    element_html: str = "",
+) -> dict:
+    """Build a finding dict in the same format as the crawler, for priority test failures."""
+    fp_key = selector or visible_text[:40]
+    return {
+        "severity":      severity,
+        "issue_type":    issue_type,
+        "fingerprint":   make_fingerprint(site_domain, url, issue_type, fp_key),
+        "page_url":      url,
+        "page_title":    page_title,
+        "section_hint":  test_name,
+        "element_type":  "Priority check",
+        "visible_text":  visible_text[:80],
+        "broken_url":    "",
+        "http_status":   http_status,
+        "css_selector":  selector,
+        "element_html":  element_html[:400] if element_html else "",
+        "devtools_cmd":  f'document.querySelector("{selector}")' if selector else "",
+        "plain_english": plain_english,
+    }
+
+
+def _run_element_check(
+    page,
+    site_domain: str,
+    url: str,
+    page_title: str,
+    test_name: str,
+    selector: str,
+    label: str,
+    severity: str,
+    check_type: str,
+):
+    """
+    Run a single element check on an open Playwright page.
+    Returns a finding dict if the check fails, or None if it passes.
+    check_type: "visible" (default) | "enabled" (implies visible too)
+    """
+    try:
+        count = page.locator(selector).count()
+        if count == 0:
+            return _priority_finding(
+                site_domain, url, page_title, test_name,
+                "missing_element", severity,
+                f"{label} not found",
+                (
+                    f'The "{label}" element was not found on the {test_name} page '
+                    f"(selector: {selector}). It may have been removed or the page structure changed."
+                ),
+                selector=selector,
+            )
+
+        locator = page.locator(selector).first
+
+        if check_type in ("visible", "enabled"):
+            visible = locator.is_visible()
+            if not visible:
+                try:
+                    elem_html = locator.evaluate("el => el.outerHTML")
+                except Exception:
+                    elem_html = ""
+                return _priority_finding(
+                    site_domain, url, page_title, test_name,
+                    "hidden_element", severity,
+                    f"{label} is hidden",
+                    (
+                        f'The "{label}" element on the {test_name} page is present in the HTML '
+                        f"but hidden via CSS (display:none / visibility:hidden). Visitors cannot see it."
+                    ),
+                    selector=selector,
+                    element_html=elem_html,
+                )
+
+        if check_type == "enabled":
+            enabled = locator.is_enabled()
+            if not enabled:
+                return _priority_finding(
+                    site_domain, url, page_title, test_name,
+                    "button_disabled", severity,
+                    f"{label} is disabled",
+                    (
+                        f'The "{label}" button on the {test_name} page is visible but has the '
+                        f"disabled attribute set — users cannot click it."
+                    ),
+                    selector=selector,
+                )
+
+    except Exception as e:
+        return _priority_finding(
+            site_domain, url, page_title, test_name,
+            "missing_element", severity,
+            f"{label} check error",
+            (
+                f'Checking the "{label}" element on the {test_name} page raised an error: '
+                f"{str(e)[:120]}"
+            ),
+            selector=selector,
+        )
+
+    return None  # check passed
+
+
+def _run_action_step(page, site_domain: str, url: str, page_title: str, test_name: str, step: dict):
+    """
+    Execute one interaction step (click or fill) on an open Playwright page.
+    Returns a finding dict if the step or its post-action assertion fails, or None on success.
+    """
+    action_type = step["type"]
+    selector    = step["selector"]
+    label       = step.get("label", selector)
+    severity    = step.get("severity", "critical")
+
+    try:
+        locator = page.locator(selector).first
+
+        if action_type == "click":
+            if not locator.is_visible():
+                return _priority_finding(
+                    site_domain, url, page_title, test_name,
+                    "hidden_element", severity,
+                    f"{label} not clickable (hidden)",
+                    (
+                        f'The "{label}" element on the {test_name} page is hidden '
+                        f"— the click action could not be performed."
+                    ),
+                    selector=selector,
+                )
+            locator.click(timeout=5000)
+            page.wait_for_timeout(step.get("wait_ms", 3000))
+
+        elif action_type == "fill":
+            locator.fill(step.get("value", ""), timeout=5000)
+            page.wait_for_timeout(step.get("wait_ms", 500))
+
+        # Post-action assertion
+        assert_spec = step.get("assert")
+        if assert_spec:
+            assert_sel      = assert_spec["selector"]
+            assert_check    = assert_spec.get("check", "visible")
+            assert_label    = assert_spec.get("label", assert_sel)
+            assert_severity = assert_spec.get("severity", severity)
+
+            if assert_check == "visible":
+                try:
+                    page.wait_for_selector(assert_sel, timeout=5000, state="visible")
+                except Exception:
+                    exists = page.locator(assert_sel).count() > 0
+                    issue_type = "hidden_element" if exists else "missing_element"
+                    return _priority_finding(
+                        site_domain, url, page_title, test_name,
+                        issue_type, assert_severity,
+                        f"After '{label}': {assert_label} not visible",
+                        (
+                            f'After clicking "{label}" on the {test_name} page, '
+                            f'the expected "{assert_label}" did not appear — '
+                            f"the action may have failed silently."
+                        ),
+                        selector=assert_sel,
+                    )
+
+            elif assert_check == "url_contains":
+                expected = assert_spec.get("value", "")
+                current  = page.url
+                if expected not in current:
+                    return _priority_finding(
+                        site_domain, url, page_title, test_name,
+                        "interaction_failed", assert_severity,
+                        f"After '{label}': unexpected URL",
+                        (
+                            f'After clicking "{label}" on the {test_name} page, '
+                            f'expected the URL to contain "{expected}" '
+                            f'but landed on: {current[:80]}'
+                        ),
+                        selector=selector,
+                    )
+
+    except Exception as e:
+        return _priority_finding(
+            site_domain, url, page_title, test_name,
+            "interaction_failed", severity,
+            f"'{label}' action failed",
+            f'The "{label}" interaction on the {test_name} page failed: {str(e)[:120]}',
+            selector=selector,
+        )
+
+    return None  # step passed
+
+
+# ---------------------------------------------------------------------------
+# Priority page checker (Playwright-based)
+# ---------------------------------------------------------------------------
+
+def check_priority_pages(base_url: str, secret: str = "") -> dict:
+    """
+    Run the PRIORITY_TESTS for a single site using a headless Playwright browser.
+    Checks computed CSS visibility, element presence, button enabled state, and
+    optional click/fill interactions.  Returns a result dict in the same format
+    as crawl_site() so it can be passed directly to post_to_ingest().
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        print(f"  [priority] Playwright not available — skipping {base_url}")
+        return {
+            "site":          urlparse(base_url).netloc,
+            "pages_crawled": 0,
+            "started_at":    now_iso(),
+            "completed_at":  now_iso(),
+            "findings":      [],
+        }
+
+    site_domain   = urlparse(base_url).netloc.lower().removeprefix("www.")
+    tests         = PRIORITY_TESTS.get(base_url, [])
+    findings: list = []
+    pages_checked = 0
+    started_at    = now_iso()
+
+    print(f"\n{'='*65}")
+    print(f"  Priority tests: {base_url}  ({len(tests)} tests)")
+    print(f"{'='*65}")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=HEADERS["User-Agent"],
+        )
+
+        for test in tests:
+            test_name = test["name"]
+
+            # Resolve URL: fixed or weekly rotation
+            if "url" in test:
+                url = test["url"]
+            else:
+                rotation = test["url_rotation"]
+                url = rotation[_WEEK_NUM % len(rotation)]
+
+            print(f"  [{pages_checked + 1:>2}] {test_name}: {url[:70]}")
+
+            findings_before = len(findings)
+            page       = context.new_page()
+            page_title = test_name  # fallback until real title is fetched
+
+            try:
+                resp        = page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                http_status = resp.status if resp else None
+
+                if http_status and http_status >= 400:
+                    findings.append(_priority_finding(
+                        site_domain, url, page_title, test_name,
+                        "page_load_failed", "critical",
+                        f"Page load failed (HTTP {http_status})",
+                        (
+                            f"The {test_name} page at {url} returned HTTP {http_status} "
+                            f"and cannot be accessed — it may be offline or access-restricted."
+                        ),
+                        http_status=http_status,
+                    ))
+                    pages_checked += 1
+                    page.close()
+                    continue
+
+                # Wait for key element before running checks
+                wait_sel = test.get("wait_for")
+                if wait_sel:
+                    try:
+                        page.wait_for_selector(wait_sel, timeout=6000)
+                    except Exception:
+                        pass  # keep going — checks will catch missing elements
+
+                # Fetch actual page title
+                try:
+                    page_title = page.title() or test_name
+                except Exception:
+                    pass
+
+                # Run element checks
+                for chk in test.get("checks", []):
+                    finding = _run_element_check(
+                        page, site_domain, url, page_title, test_name,
+                        chk["selector"],
+                        chk["label"],
+                        chk.get("severity", "high"),
+                        chk.get("check", "visible"),
+                    )
+                    if finding:
+                        findings.append(finding)
+
+                # Run interaction steps
+                for step in test.get("actions", []):
+                    finding = _run_action_step(
+                        page, site_domain, url, page_title, test_name, step
+                    )
+                    if finding:
+                        findings.append(finding)
+
+                pages_checked += 1
+
+            except Exception as e:
+                print(f"       Error loading {url}: {e}")
+                findings.append(_priority_finding(
+                    site_domain, url, page_title, test_name,
+                    "page_load_failed", "critical",
+                    "Page failed to load",
+                    f"The {test_name} page at {url} could not be loaded: {str(e)[:120]}",
+                ))
+                pages_checked += 1
+
+            # Screenshot if the test produced any findings
+            new_findings = findings[findings_before:]
+            if new_findings:
+                try:
+                    img_bytes = page.screenshot(type="jpeg", quality=75, full_page=False)
+                    img_b64   = base64.b64encode(img_bytes).decode("utf-8")
+                    shot_url  = upload_screenshot(url, img_b64, secret)
+                    if shot_url:
+                        for f in new_findings:
+                            f["screenshot_url"] = shot_url
+                except Exception as e:
+                    print(f"       Screenshot failed: {e}")
+
+            page.close()
+
+        browser.close()
+
+    completed_at = now_iso()
+    print(f"  Done.  Tests run: {pages_checked}  |  Findings: {len(findings)}")
+
+    return {
+        "site":          urlparse(base_url).netloc,
+        "pages_crawled": pages_checked,
+        "started_at":    started_at,
+        "completed_at":  completed_at,
+        "findings":      findings,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Crawler
 # ---------------------------------------------------------------------------
 
@@ -934,40 +1667,69 @@ def post_to_ingest(payload: dict, secret: str) -> bool:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # ── CLI flags ─────────────────────────────────────────────────────────────
+    parser = argparse.ArgumentParser(description="SiteWatch Crawler")
+    parser.add_argument(
+        "--test-mode",
+        choices=["priority", "crawl"],
+        default=None,
+        help=(
+            "priority — run only Playwright-based priority transaction tests (fast, ~2 min); "
+            "crawl    — full HTML crawl (default when flag is omitted)"
+        ),
+    )
+    args = parser.parse_args()
+
+    # Also accept TEST_MODE env var so GitHub Actions workflows can set it without
+    # changing the `run: python checker.py` command.
+    test_mode = args.test_mode or os.environ.get("TEST_MODE", "").strip().lower() or "crawl"
+
+    # ── Secret ────────────────────────────────────────────────────────────────
     secret = os.environ.get("CRAWLER_INGEST_SECRET", "").strip()
     if not secret:
         print("ERROR: CRAWLER_INGEST_SECRET env var is not set.")
         sys.exit(1)
 
-    # Optional: filter to a single site (set via workflow_dispatch input)
+    # ── Site filter (shared by both modes) ───────────────────────────────────
     site_filter = os.environ.get("SITE_FILTER", "").strip().lower().removeprefix("www.")
     if site_filter:
-        sites_to_crawl = [
+        sites_to_run = [
             s for s in SITES
             if site_filter in s.lower().removeprefix("https://").removeprefix("www.")
         ]
-        if not sites_to_crawl:
+        if not sites_to_run:
             print(f"ERROR: No site matched SITE_FILTER='{site_filter}'. Available: {SITES}")
             sys.exit(1)
-        print(f"SITE_FILTER='{site_filter}' — crawling: {sites_to_crawl}")
+        print(f"SITE_FILTER='{site_filter}' — running on: {sites_to_run}")
     else:
-        sites_to_crawl = SITES
+        sites_to_run = SITES
 
-    from concurrent.futures import ThreadPoolExecutor as SitePool
-    results = []
-    with SitePool(max_workers=len(sites_to_crawl)) as pool:
-        futures = {pool.submit(crawl_site, url, secret): url for url in sites_to_crawl}
-        for future in as_completed(futures):
-            results.append(future.result())
+    # ── Run ───────────────────────────────────────────────────────────────────
+    if test_mode == "priority":
+        # Priority mode: Playwright-based transaction tests only — one site at a time
+        # (Playwright does not benefit from multi-threading; browser isolation is per call)
+        print(f"\nMode: PRIORITY TESTS  (week {_WEEK_NUM})")
+        results = [check_priority_pages(url, secret) for url in sites_to_run]
 
+    else:
+        # Crawl mode: full HTML crawl (original behaviour)
+        print(f"\nMode: FULL CRAWL")
+        from concurrent.futures import ThreadPoolExecutor as SitePool
+        results = []
+        with SitePool(max_workers=len(sites_to_run)) as pool:
+            futures = {pool.submit(crawl_site, url, secret): url for url in sites_to_run}
+            for future in as_completed(futures):
+                results.append(future.result())
+
+    # ── Post results ──────────────────────────────────────────────────────────
     success_count = 0
     for payload in results:
         if post_to_ingest(payload, secret):
             success_count += 1
 
     print(f"\n{'='*65}")
-    print(f"  Done. {success_count}/{len(SITES)} sites posted successfully.")
+    print(f"  Done. {success_count}/{len(sites_to_run)} sites posted successfully.")
     print(f"{'='*65}\n")
 
-    if success_count < len(sites_to_crawl):
+    if success_count < len(sites_to_run):
         sys.exit(1)
