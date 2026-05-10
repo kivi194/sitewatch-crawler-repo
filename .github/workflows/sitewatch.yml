@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: "0 */12 * * *"
   workflow_dispatch:
+    inputs:
+      site:
+        description: "Domain to scan (e.g. israelpharm.com). Leave empty to scan all sites."
+        required: false
+        default: ""
 jobs:
   crawl:
     runs-on: ubuntu-latest
@@ -23,4 +28,5 @@ jobs:
       - name: Run crawler
         env:
           CRAWLER_INGEST_SECRET: ${{ secrets.CRAWLER_INGEST_SECRET }}
+          SITE_FILTER: ${{ inputs.site }}
         run: python checker.py

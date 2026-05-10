@@ -14,6 +14,7 @@ import os
 import sys
 import re
 import base64
+import hashlib
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urldefrag
@@ -38,11 +39,71 @@ INGEST_URL = os.environ.get(
     "https://anchor-watcher.lovable.app/api/public/crawler/ingest"
 )
 
-SITES = [
-    "https://israelpharm.com",
-    "https://www.rxfor.me/",
-    "http://reekooz.com/",
+# Per-site config: base_url + priority pages to always check first
+SITE_CONFIG = [
+    {
+        "base_url": "https://israelpharm.com",
+        "priority_urls": [
+            "https://israelpharm.com/",
+            # NOTE: /shop/, /cart/, /checkout/ are blocked by Cloudflare Access.
+            # Whitelist GitHub Actions IPs in Cloudflare to enable crawling these pages.
+        ],
+    },
+    {
+        "base_url": "https://www.rxfor.me",
+        "priority_urls": [
+            "https://www.rxfor.me/",
+            "https://www.rxfor.me/treatments/",
+            "https://www.rxfor.me/treatments/weight-loss",
+            "https://www.rxfor.me/treatments/ed-treatment",
+            "https://www.rxfor.me/treatments/testosterone-men",
+            "https://www.rxfor.me/treatments/testosterone-women",
+            "https://www.rxfor.me/treatments/hair-loss",
+            "https://www.rxfor.me/treatments/prescription-renewal",
+            "https://www.rxfor.me/auth",           # consult flow entry
+            "https://www.rxfor.me/about",
+            "https://www.rxfor.me/cart",
+            "https://www.rxfor.me/checkout",
+        ],
+    },
+    {
+        "base_url": "https://www.reekooz.com",
+        "priority_urls": [
+            "https://www.reekooz.com/",
+            "https://www.reekooz.com/shop/",
+            # Key products
+            "https://www.reekooz.com/product/zoomind/",
+            "https://www.reekooz.com/product/nowonder-nasal-cleanser/",
+            "https://www.reekooz.com/product/enovid-nitric-oxide-spray/",
+            "https://www.reekooz.com/product/nasodine/",
+            "https://www.reekooz.com/product/phyllotex/",
+            # Vitamin packs
+            "https://www.reekooz.com/product/immune-pack/",
+            "https://www.reekooz.com/product/allergy-pack/",
+            "https://www.reekooz.com/product/healthy-weight-pack/",
+            "https://www.reekooz.com/product/sleep-pack/",
+            "https://www.reekooz.com/product/stress-pack/",
+            "https://www.reekooz.com/product/energy-pack/",
+            "https://www.reekooz.com/product/his-essentials/",
+            "https://www.reekooz.com/product/her-essentials/",
+            "https://www.reekooz.com/product/longevity-pack/",
+            "https://www.reekooz.com/product/bone-health-pack/",
+            "https://www.reekooz.com/product/gut-pack/",
+            # Support pages
+            "https://www.reekooz.com/faq/",
+            "https://www.reekooz.com/faq/zoomind/",
+            "https://www.reekooz.com/faq/enovid/",
+            "https://www.reekooz.com/about-us/",
+            "https://www.reekooz.com/contact-us/",
+            "https://www.reekooz.com/cart/",
+            "https://www.reekooz.com/checkout/",
+        ],
+    },
 ]
+
+# Flat list for entry point
+SITES = [s["base_url"] for s in SITE_CONFIG]
+PRIORITY_URLS = {s["base_url"]: s["priority_urls"] for s in SITE_CONFIG}
 
 MAX_PAGES_PER_SITE      = 200
 REQUEST_DELAY           = 0.3
@@ -85,6 +146,9 @@ CTA_KEYWORDS = {
     "apply", "register", "download", "get quote", "try", "start",
 }
 
+# Anchors that look like JS hooks — not real missing sections
+_JS_ANCHOR_RE = re.compile(r'^[!_\-0-9]|^top$|^wrap$|^content$', re.IGNORECASE)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -96,7 +160,9 @@ def normalize(url: str) -> str:
 
 
 def same_domain(url: str, base: str) -> bool:
-    return urlparse(url).netloc == urlparse(base).netloc
+    def root(u):
+        return urlparse(u).netloc.lower().removeprefix("www.")
+    return root(url) == root(base)
 
 
 def crawlable(url: str) -> bool:
@@ -115,13 +181,68 @@ def is_bot_protected(url: str) -> bool:
 
 def is_widget_text(text: str) -> bool:
     """Return True if the link text looks like auto-generated widget content."""
-    # Strip non-alpha chars — if less than 3 real letters remain, it's widget noise
     clean = re.sub(r"[^a-zA-Z\s]", "", text).strip()
     return len(clean) < 3
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def get_css_selector(tag) -> str:
+    """
+    Generate a CSS selector for a BeautifulSoup tag.
+    Usable directly in Chrome DevTools: Elements > Ctrl+F, or Console > document.querySelector(...)
+    """
+    if tag is None:
+        return ""
+    parts = []
+    current = tag
+    for _ in range(6):
+        if not hasattr(current, "name") or not current.name or current.name == "[document]":
+            break
+        el_id = (current.get("id") or "").strip()
+        if el_id:
+            # ID is unique — stop here
+            safe_id = el_id.replace('"', '\\"')
+            parts.insert(0, f'#{safe_id}')
+            break
+        node_sel = current.name
+        classes = [
+            c for c in (current.get("class") or [])
+            if c and not c.startswith("js-") and not c.startswith("is-") and len(c) > 1
+        ]
+        if classes:
+            node_sel += "." + ".".join(classes[:2])
+        parts.insert(0, node_sel)
+        current = current.parent
+    return " > ".join(parts) if parts else (tag.name or "")
+
+
+def get_element_html(tag) -> str:
+    """Return a compact snippet of the element's outerHTML for visual identification."""
+    if tag is None:
+        return ""
+    raw = str(tag)
+    # Collapse whitespace so it reads as one line
+    compact = re.sub(r"\s+", " ", raw).strip()
+    return compact[:400] + ("..." if len(compact) > 400 else "")
+
+
+def make_fingerprint(site_domain: str, page_url: str, issue_type: str,
+                     broken_url: str = "", visible_text: str = "") -> str:
+    """
+    Stable hash that identifies a finding across runs.
+    Uses URL paths (not full URLs) so http vs https and trailing slashes don't create duplicates.
+    The ingest endpoint uses this to skip findings that are already open.
+    """
+    page_path  = urlparse(page_url).path.rstrip("/") or "/"
+    if broken_url:
+        broken_key = urlparse(broken_url).path.rstrip("/") or broken_url[:80]
+    else:
+        broken_key = visible_text[:40].lower().strip()
+    raw = "|".join([site_domain, page_path, issue_type, broken_key])
+    return hashlib.md5(raw.encode()).hexdigest()
 
 
 def head_check(url: str, session: requests.Session, retries: int = RETRY_ON_ERROR):
@@ -137,13 +258,12 @@ def head_check(url: str, session: requests.Session, retries: int = RETRY_ON_ERRO
                 continue
             return r.status_code, None
         except requests.exceptions.SSLError as e:
-            # Try HTTP fallback before reporting SSL error
             if url.startswith("https://"):
                 http_url = "http://" + url[8:]
                 try:
                     r2 = session.head(http_url, timeout=TIMEOUT, allow_redirects=True)
                     if r2.status_code < 400:
-                        return r2.status_code, None   # works over HTTP — not user-facing
+                        return r2.status_code, None
                 except Exception:
                     pass
             return None, f"SSL error: {str(e)[:100]}"
@@ -162,10 +282,16 @@ def head_check(url: str, session: requests.Session, retries: int = RETRY_ON_ERRO
     return None, "Failed after retries"
 
 
-def is_truly_broken(status, error: str) -> bool:
-    """Return True only for genuine breakage — not bot-blocks or auth walls."""
+def is_truly_broken(status, error: str, is_external: bool = False) -> bool:
+    """
+    Return True only for genuine breakage.
+    For external links, network errors (timeout, connection refused) are NOT flagged —
+    external sites often block crawlers transiently. Only definitive HTTP errors count.
+    """
+    if is_external:
+        return status in BROKEN_STATUSES
     if error:
-        return True   # connection error, SSL, timeout = real problem
+        return True   # internal connection error, SSL, timeout = real problem
     return status in BROKEN_STATUSES
 
 
@@ -255,10 +381,10 @@ def get_issue_type(status, error: str, is_form: bool) -> str:
         return "broken_form"
     if error:
         err = error.lower()
-        if "ssl" in err:   return "ssl_error"
-        if "timeout" in err: return "timeout"
+        if "ssl" in err:      return "ssl_error"
+        if "timeout" in err:  return "timeout"
         return "unreachable"
-    if status == 404:      return "broken_link"
+    if status == 404:         return "broken_link"
     if status and status >= 500: return "server_error"
     return "broken_link"
 
@@ -299,10 +425,11 @@ def get_plain_english(visible_text: str, element_type: str, page_title: str,
 
 
 # ---------------------------------------------------------------------------
-# New UX checks (pure HTML — no external requests, zero false positives)
+# UX checks (pure HTML — no external requests)
 # ---------------------------------------------------------------------------
 
-def check_broken_images(soup, url: str, page_title: str, session, checked, checked_lock) -> list:
+def check_broken_images(soup, url: str, page_title: str, site_domain: str,
+                        session, checked, checked_lock) -> list:
     """Internal images that return 4xx/5xx."""
     findings = []
     seen = set()
@@ -328,18 +455,23 @@ def check_broken_images(soup, url: str, page_title: str, session, checked, check
             status, error = cached
 
         if status in BROKEN_STATUSES:
-            alt = img.get("alt", "").strip() or "[no alt text]"
+            alt     = img.get("alt", "").strip() or "[no alt text]"
             section = get_section_hint(img)
+            css_sel = get_css_selector(img)
             findings.append({
-                "severity":     "high",
-                "issue_type":   "broken_image",
-                "page_url":     url,
-                "page_title":   page_title,
-                "section_hint": section,
-                "element_type": "Image",
-                "visible_text": alt[:80],
-                "broken_url":   full_src,
-                "http_status":  status,
+                "severity":      "high",
+                "issue_type":    "broken_image",
+                "fingerprint":   make_fingerprint(site_domain, url, "broken_image", full_src),
+                "page_url":      url,
+                "page_title":    page_title,
+                "section_hint":  section,
+                "element_type":  "Image",
+                "visible_text":  alt[:80],
+                "broken_url":    full_src,
+                "http_status":   status,
+                "css_selector":  css_sel,
+                "element_html":  get_element_html(img),
+                "devtools_cmd":  f'document.querySelector("{css_sel}")',
                 "plain_english": (
                     f'An image ("{alt}") on the "{page_title}" page '
                     f"is broken and won't display — visitors will see a broken image icon."
@@ -348,26 +480,39 @@ def check_broken_images(soup, url: str, page_title: str, session, checked, check
     return findings
 
 
-def check_empty_elements(soup, url: str, page_title: str) -> list:
-    """Buttons and links with no visible text, aria-label, or image."""
+def check_empty_elements(soup, url: str, page_title: str, site_domain: str) -> list:
+    """
+    Buttons and links with no accessible label.
+    SVG-only icon buttons are valid (the SVG is the visual label) — skip them.
+    aria-hidden elements are intentionally invisible — skip them.
+    """
     findings = []
 
     for btn in soup.find_all("button"):
+        if btn.get("aria-hidden") == "true":
+            continue
         text  = btn.get_text(strip=True)
         aria  = btn.get("aria-label", "").strip()
         title = btn.get("title", "").strip()
-        if not text and not aria and not title and not btn.find("img"):
+        has_svg = bool(btn.find("svg"))
+        has_img = bool(btn.find("img"))
+        if not text and not aria and not title and not has_svg and not has_img:
             section = get_section_hint(btn)
+            css_sel = get_css_selector(btn)
             findings.append({
-                "severity":     "medium",
-                "issue_type":   "empty_element",
-                "page_url":     url,
-                "page_title":   page_title,
-                "section_hint": section,
-                "element_type": "Button",
-                "visible_text": "[no text]",
+                "severity":      "medium",
+                "issue_type":    "empty_element",
+                "fingerprint":   make_fingerprint(site_domain, url, "empty_element", "", "button:" + css_sel),
+                "page_url":      url,
+                "page_title":    page_title,
+                "section_hint":  section,
+                "element_type":  "Button",
+                "visible_text":  "[no text]",
+                "css_selector":  css_sel,
+                "element_html":  get_element_html(btn),
+                "devtools_cmd":  f'document.querySelector("{css_sel}")',
                 "plain_english": (
-                    f'A button on the "{page_title}" page has no visible text or label — '
+                    f'A button on the "{page_title}" page has no visible text, label, or icon — '
                     f"users can't tell what it does."
                 ),
             })
@@ -376,20 +521,29 @@ def check_empty_elements(soup, url: str, page_title: str) -> list:
         href = a.get("href", "").strip()
         if any(href.startswith(s) for s in SKIP_SCHEMES):
             continue
-        text = a.get_text(strip=True)
-        aria = a.get("aria-label", "").strip()
-        if not text and not aria and not a.find("img"):
+        if a.get("aria-hidden") == "true":
+            continue
+        text    = a.get_text(strip=True)
+        aria    = a.get("aria-label", "").strip()
+        has_svg = bool(a.find("svg"))
+        has_img = bool(a.find("img"))
+        if not text and not aria and not has_svg and not has_img:
             section = get_section_hint(a)
+            css_sel = get_css_selector(a)
             findings.append({
-                "severity":     "low",
-                "issue_type":   "empty_element",
-                "page_url":     url,
-                "page_title":   page_title,
-                "section_hint": section,
-                "element_type": "Link",
-                "visible_text": "[no text]",
+                "severity":      "low",
+                "issue_type":    "empty_element",
+                "fingerprint":   make_fingerprint(site_domain, url, "empty_element", "", "link:" + css_sel),
+                "page_url":      url,
+                "page_title":    page_title,
+                "section_hint":  section,
+                "element_type":  "Link",
+                "visible_text":  "[no text]",
+                "css_selector":  css_sel,
+                "element_html":  get_element_html(a),
+                "devtools_cmd":  f'document.querySelector("{css_sel}")',
                 "plain_english": (
-                    f'A link on the "{page_title}" page has no visible text — '
+                    f'A link on the "{page_title}" page has no visible text or icon — '
                     f"users can't see it or know where it goes."
                 ),
             })
@@ -397,18 +551,22 @@ def check_empty_elements(soup, url: str, page_title: str) -> list:
     return findings
 
 
-def check_missing_title(soup, url: str) -> list:
+def check_missing_title(soup, url: str, site_domain: str) -> list:
     """Pages with no <title> tag or an empty one."""
     title_tag = soup.find("title")
     if not title_tag or not title_tag.get_text(strip=True):
         return [{
-            "severity":     "medium",
-            "issue_type":   "missing_title",
-            "page_url":     url,
-            "page_title":   url,
-            "section_hint": "Page head",
-            "element_type": "Page",
-            "visible_text": "Missing title",
+            "severity":      "medium",
+            "issue_type":    "missing_title",
+            "fingerprint":   make_fingerprint(site_domain, url, "missing_title"),
+            "page_url":      url,
+            "page_title":    url,
+            "section_hint":  "Page head",
+            "element_type":  "Page",
+            "visible_text":  "Missing title",
+            "css_selector":  "head > title",
+            "element_html":  "<title></title>",
+            "devtools_cmd":  'document.querySelector("head > title")',
             "plain_english": (
                 f"The page at {url} has no title tag — "
                 f"this affects browser tabs, bookmarks, and search engine rankings."
@@ -417,17 +575,17 @@ def check_missing_title(soup, url: str) -> list:
     return []
 
 
-def check_mixed_content(soup, url: str, page_title: str) -> list:
+def check_mixed_content(soup, url: str, page_title: str, site_domain: str) -> list:
     """HTTP resources loaded on an HTTPS page — browsers block these silently."""
     if not url.startswith("https://"):
         return []
 
     findings = []
     checks = [
-        (soup.find_all("img",    src=True),              "src",  "Image",      "high"),
-        (soup.find_all("script", src=True),              "src",  "Script",     "high"),
-        (soup.find_all("iframe", src=True),              "src",  "iFrame",     "medium"),
-        (soup.find_all("link",   rel="stylesheet"),      "href", "Stylesheet", "medium"),
+        (soup.find_all("img",    src=True),         "src",  "Image",      "high"),
+        (soup.find_all("script", src=True),         "src",  "Script",     "high"),
+        (soup.find_all("iframe", src=True),         "src",  "iFrame",     "medium"),
+        (soup.find_all("link",   rel="stylesheet"), "href", "Stylesheet", "medium"),
     ]
     seen = set()
     for tags, attr, elem_label, severity in checks:
@@ -436,15 +594,20 @@ def check_mixed_content(soup, url: str, page_title: str) -> list:
             if resource.startswith("http://") and resource not in seen:
                 seen.add(resource)
                 section = get_section_hint(tag)
+                css_sel = get_css_selector(tag)
                 findings.append({
-                    "severity":     severity,
-                    "issue_type":   "mixed_content",
-                    "page_url":     url,
-                    "page_title":   page_title,
-                    "section_hint": section,
-                    "element_type": elem_label,
-                    "visible_text": resource[:80],
-                    "broken_url":   resource,
+                    "severity":      severity,
+                    "issue_type":    "mixed_content",
+                    "fingerprint":   make_fingerprint(site_domain, url, "mixed_content", resource),
+                    "page_url":      url,
+                    "page_title":    page_title,
+                    "section_hint":  section,
+                    "element_type":  elem_label,
+                    "visible_text":  resource[:80],
+                    "broken_url":    resource,
+                    "css_selector":  css_sel,
+                    "element_html":  get_element_html(tag),
+                    "devtools_cmd":  f'document.querySelector("{css_sel}")',
                     "plain_english": (
                         f'A {elem_label.lower()} on "{page_title}" loads over HTTP on an HTTPS page '
                         f"— browsers will block it silently, breaking the page for visitors."
@@ -453,10 +616,13 @@ def check_mixed_content(soup, url: str, page_title: str) -> list:
     return findings
 
 
-def check_broken_anchors(soup, url: str, page_title: str) -> list:
-    """<a href="#id"> links where the target ID doesn't exist on the page."""
-    all_ids = {tag.get("id") for tag in soup.find_all(id=True)}
-    all_names = {tag.get("name") for tag in soup.find_all(attrs={"name": True})}
+def check_broken_anchors(soup, url: str, page_title: str, site_domain: str) -> list:
+    """
+    <a href="#id"> links where the target ID doesn't exist on the page.
+    Skips JS-hook anchors (#!, #0, #top, etc.) which are intentionally used by scripts.
+    """
+    all_ids     = {tag.get("id")   for tag in soup.find_all(id=True)}
+    all_names   = {tag.get("name") for tag in soup.find_all(attrs={"name": True})}
     valid_anchors = all_ids | all_names
 
     findings = []
@@ -465,18 +631,28 @@ def check_broken_anchors(soup, url: str, page_title: str) -> list:
         if not href.startswith("#"):
             continue
         anchor = href[1:]
-        if anchor and anchor not in valid_anchors:
+        if not anchor:
+            continue
+        # Skip anchors that are clearly JS hooks, not real section targets
+        if _JS_ANCHOR_RE.match(anchor):
+            continue
+        if anchor not in valid_anchors:
             visible = tag.get_text(strip=True) or tag.get("aria-label", "") or "[no text]"
             section = get_section_hint(tag)
+            css_sel = get_css_selector(tag)
             findings.append({
-                "severity":     "low",
-                "issue_type":   "broken_anchor",
-                "page_url":     url,
-                "page_title":   page_title,
-                "section_hint": section,
-                "element_type": "Anchor link",
-                "visible_text": visible[:80],
-                "broken_url":   f"{url}#{anchor}",
+                "severity":      "low",
+                "issue_type":    "broken_anchor",
+                "fingerprint":   make_fingerprint(site_domain, url, "broken_anchor", f"#{anchor}"),
+                "page_url":      url,
+                "page_title":    page_title,
+                "section_hint":  section,
+                "element_type":  "Anchor link",
+                "visible_text":  visible[:80],
+                "broken_url":    f"{url}#{anchor}",
+                "css_selector":  css_sel,
+                "element_html":  get_element_html(tag),
+                "devtools_cmd":  f'document.querySelector("{css_sel}")',
                 "plain_english": (
                     f'The "{visible}" link on "{page_title}" jumps to #{anchor} '
                     f"but that section doesn't exist on the page — clicking it does nothing."
@@ -493,6 +669,7 @@ def crawl_site(base_url: str, secret: str = "") -> dict:
     session = requests.Session()
     session.headers.update(HEADERS)
 
+    site_domain  = urlparse(base_url).netloc.lower().removeprefix("www.")
     visited      = set()
     queue        = deque()
     checked      = {}
@@ -505,10 +682,14 @@ def crawl_site(base_url: str, secret: str = "") -> dict:
     print(f"  Crawling: {base_url}")
     print(f"{'='*65}")
 
+    # Seed priority pages first, then sitemap, then let crawler discover the rest
+    for u in PRIORITY_URLS.get(base_url, []):
+        queue.append(u)
     sitemap_urls = fetch_sitemap_urls(base_url, session)
     for u in sitemap_urls:
         queue.append(u)
-    queue.appendleft(base_url)
+    if not queue:
+        queue.appendleft(base_url)
 
     def check_url(url: str):
         norm = normalize(url)
@@ -578,18 +759,21 @@ def crawl_site(base_url: str, secret: str = "") -> dict:
                        for item in external_items.values()}
             for future in as_completed(futures):
                 full, tag, status, error = future.result()
-                if not is_truly_broken(status, error):
+                # External links: only flag definitive HTTP errors, not transient network issues
+                if not is_truly_broken(status, error, is_external=True):
                     continue
-                visible   = (tag.get_text(strip=True) or tag.get("aria-label", "") or "[no text]")[:80]
+                visible    = (tag.get_text(strip=True) or tag.get("aria-label", "") or "[no text]")[:80]
                 if is_widget_text(visible):
                     continue
-                section   = get_section_hint(tag)
-                elem_type = get_element_type(tag, section, visible)
+                section    = get_section_hint(tag)
+                elem_type  = get_element_type(tag, section, visible)
                 issue_type = get_issue_type(status, error or "", is_form=False)
                 severity   = get_severity(elem_type, issue_type, url, full)
+                css_sel    = get_css_selector(tag)
                 findings.append({
                     "severity":      severity,
                     "issue_type":    issue_type,
+                    "fingerprint":   make_fingerprint(site_domain, url, issue_type, full),
                     "page_url":      url,
                     "page_title":    page_title,
                     "section_hint":  section,
@@ -597,6 +781,9 @@ def crawl_site(base_url: str, secret: str = "") -> dict:
                     "visible_text":  visible,
                     "broken_url":    full,
                     "http_status":   status,
+                    "css_selector":  css_sel,
+                    "element_html":  get_element_html(tag),
+                    "devtools_cmd":  f'document.querySelector("{css_sel}")',
                     "plain_english": get_plain_english(
                         visible, elem_type, page_title, issue_type, status, error or ""
                     ),
@@ -625,9 +812,11 @@ def crawl_site(base_url: str, secret: str = "") -> dict:
                     or submit_btn.get("aria-label", "")
                 )[:80]
             visible = visible or "Submit"
+            css_sel = get_css_selector(form)
             findings.append({
                 "severity":      severity,
                 "issue_type":    issue_type,
+                "fingerprint":   make_fingerprint(site_domain, url, issue_type, full_action),
                 "page_url":      url,
                 "page_title":    page_title,
                 "section_hint":  section,
@@ -635,17 +824,20 @@ def crawl_site(base_url: str, secret: str = "") -> dict:
                 "visible_text":  visible,
                 "broken_url":    full_action,
                 "http_status":   status,
+                "css_selector":  css_sel,
+                "element_html":  get_element_html(form),
+                "devtools_cmd":  f'document.querySelector("{css_sel}")',
                 "plain_english": get_plain_english(
                     visible, "Form submit", page_title, issue_type, status, error or ""
                 ),
             })
 
-        # --- New UX checks (pure HTML) ---
-        findings.extend(check_broken_images(soup, url, page_title, session, checked, checked_lock))
-        findings.extend(check_empty_elements(soup, url, page_title))
-        findings.extend(check_missing_title(soup, url))
-        findings.extend(check_mixed_content(soup, url, page_title))
-        findings.extend(check_broken_anchors(soup, url, page_title))
+        # --- UX checks (pure HTML) ---
+        findings.extend(check_broken_images(soup, url, page_title, site_domain, session, checked, checked_lock))
+        findings.extend(check_empty_elements(soup, url, page_title, site_domain))
+        findings.extend(check_missing_title(soup, url, site_domain))
+        findings.extend(check_mixed_content(soup, url, page_title, site_domain))
+        findings.extend(check_broken_anchors(soup, url, page_title, site_domain))
 
         # --- Screenshot for pages with new findings ---
         new_findings = [f for f in findings[page_findings_before:] if "screenshot_url" not in f]
@@ -747,10 +939,24 @@ if __name__ == "__main__":
         print("ERROR: CRAWLER_INGEST_SECRET env var is not set.")
         sys.exit(1)
 
+    # Optional: filter to a single site (set via workflow_dispatch input)
+    site_filter = os.environ.get("SITE_FILTER", "").strip().lower().removeprefix("www.")
+    if site_filter:
+        sites_to_crawl = [
+            s for s in SITES
+            if site_filter in s.lower().removeprefix("https://").removeprefix("www.")
+        ]
+        if not sites_to_crawl:
+            print(f"ERROR: No site matched SITE_FILTER='{site_filter}'. Available: {SITES}")
+            sys.exit(1)
+        print(f"SITE_FILTER='{site_filter}' — crawling: {sites_to_crawl}")
+    else:
+        sites_to_crawl = SITES
+
     from concurrent.futures import ThreadPoolExecutor as SitePool
     results = []
-    with SitePool(max_workers=len(SITES)) as pool:
-        futures = {pool.submit(crawl_site, url, secret): url for url in SITES}
+    with SitePool(max_workers=len(sites_to_crawl)) as pool:
+        futures = {pool.submit(crawl_site, url, secret): url for url in sites_to_crawl}
         for future in as_completed(futures):
             results.append(future.result())
 
@@ -763,5 +969,5 @@ if __name__ == "__main__":
     print(f"  Done. {success_count}/{len(SITES)} sites posted successfully.")
     print(f"{'='*65}\n")
 
-    if success_count < len(SITES):
+    if success_count < len(sites_to_crawl):
         sys.exit(1)
